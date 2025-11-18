@@ -14,7 +14,7 @@ VERBOTEN = {
     r"\b[A-Z][a-z]+ University\b",
     r"\b[A-Z][a-z]+ College\b",
     r"\bUniversity of [A-Za-z]+\b",
-    r"\Property of [A-Za-z]+\b"
+    r"\bProperty of [A-Za-z]+\b"
 }
 
 str.title("Artificial Examinator")
@@ -45,10 +45,11 @@ def extraction(pdf_files):
     return text
 
 def clean_question(text):
-    cleaned = text
+    cleaned = text.replace("\\", " ")
     for term in VERBOTEN:
-        cleaned = re.sub(term, " ", cleaned)
-    return cleaned.strip
+        safe = re.escape(term)
+        cleaned = re.sub(safe, " ", cleaned)
+    return cleaned.strip()
 
 def valid_question(question):
     if not re.match(r"^\d+\.\s+", question):
@@ -130,12 +131,10 @@ def question_generator(text, size=5, batch=7):
         prompt = f"""
 You are generating batch {batch_num} of {batch}.
 Generate EXACTLY {size} multiple-choice questions based on the text below.
-You are an expert exam creator. Your task is to generate EXACTLY 35 original,
-multiple-choice questions based on the provided content.
 
 CRITICAL RULES — FOLLOW THEM EXACTLY:
 
-1. You MUST output all 35 questions in full.
+1. You MUST output all {size} questions in full.
    - Do NOT skip any.
    - Do NOT summarize.
    - Do NOT write things like:
