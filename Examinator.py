@@ -5,10 +5,17 @@ import requests
 import json
 import tempfile
 import os
+import re
 from pyvis.network import Network
 
 OLLURL = "http://localhost:11434/api/generate"
 MODEL = "phi3"
+VERBOTEN = {
+    r"\b[A-Z][a-z]+ University\b",
+    r"\b[A-Z][a-z]+ College\b",
+    r"\bUniversity of [A-Za-z]+\b",
+    r"\Property of [A-Za-z]+\b"
+}
 
 str.title("Artificial Examinator")
 str.write("Upload PDFs to create a 35-question exam and answer sheet.")
@@ -37,6 +44,31 @@ def extraction(pdf_files):
 
     return text
 
+def clean_question(text):
+    cleaned = text
+    for term in VERBOTEN:
+        cleaned = re.sub(term, " ", cleaned)
+    return cleaned.strip
+
+def valid_question(question):
+    if not re.match(r"^\d+\.\s+", question):
+        return False
+    if len(question.split()) < 4:
+        return False
+    if re.search(r"\bAnswer:|\bAns\b|\bCorrect\b", question, re.IGNORECASE):
+        return False
+    if re.search(r"\[\d+\]|\(p\.\d+\)", question):
+        return False
+    if question.endswith(":"):
+        return False
+    return True
+
+def extract_questions(raw):
+    questions = re.split(r'\n\d+\.\s', "\n" + raw)
+    questions = [q.strip() for q in questions if q.strip()]
+    questions = [f"{i+1}. {q}" for i, q in enumerate(questions)]
+    return questions
+
 def knowledge_graph(text):
     graph_prompt = f"""
 Extract key concepts and relationships from the following text.
@@ -54,7 +86,13 @@ Text:
 
     try:
         return json.loads(response)
-    except:
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except:
+                return {"nodes": [], "edges": []}
         return {"nodes": [], "edges": []}
 
 def display_kg(kg):
@@ -74,24 +112,83 @@ def display_kg(kg):
     str.subheader("Knowledge Graph")
     str.components.v1.html(open(path, "r").read(), height=650)
 
-def question_generator(text):
-    prompt = f"""
-Create 35 multiple-choice questions from the text below.
+def question_batch(prompt, expected=5, max_retries=3):
+    for attempt in range(max_retries):
+        response = query(prompt)
+        raw = extract_questions(response)
+        cleaned = [clean_question(q) for q in raw]
+        valid = [q for q in cleaned if valid_question(q)]
+        if len(valid) >= expected:
+            return valid[:expected]
+    needed = expected - len(valid)
+    valid += [f"{len(valid)+i+1}. [FAILED TO GENERATE QUESTION]" for i in range(needed)]
+    return valid
 
-Format EXACTLY like this:
+def question_generator(text, size=5, batch=7):
+    questions = []
+    for batch_num in range(1, batch + 1):
+        prompt = f"""
+You are generating batch {batch_num} of {batch}.
+Generate EXACTLY {size} multiple-choice questions based on the text below.
+You are an expert exam creator. Your task is to generate EXACTLY 35 original,
+multiple-choice questions based on the provided content.
 
-1. Question?
+CRITICAL RULES — FOLLOW THEM EXACTLY:
+
+1. You MUST output all 35 questions in full.
+   - Do NOT skip any.
+   - Do NOT summarize.
+   - Do NOT write things like:
+     • "This pattern continues..."
+     • "And so on..."
+     • "Repeat the same for the rest."
+   If you skip or summarize even once, the output is invalid.
+
+2. DO NOT copy sentences from the text.
+   - Paraphrase everything.
+   - Reformulate concepts in your own words.
+
+3. REMOVE ANY personal names, institution names, school names,
+   company names, or specific locations found in the text.
+
+4. Each question MUST have:
+   - A clear question
+   - Four answer choices (A–D)
+   - EXACTLY one correct answer
+   - A difficulty label (Easy, Medium, or Hard)
+
+5. Use this output format EXACTLY:
+
+1. Question text?
+   A. Option
+   B. Option
+   C. Option
+   D. Option
+Correct: B
+Difficulty: Medium
+
+2. Question text?
    A. Option
    B. Option
    C. Option
    D. Option
 Correct: A
-Difficulty: Medium
+Difficulty: Easy
 
-Text:
+(continue this exact pattern until question {size})
+
+TEXT FOR QUESTION GENERATION:
 {text}
 """
-    return query(prompt)
+        batch_questions = question_batch(prompt, expected=size)
+        questions.extend(batch_questions)
+
+    # Renumber to 1-35
+    final_questions = []
+    for i, q in enumerate(questions, start=1):
+        q_fixed = re.sub(r"^\d+\.", f"{i}.", q)
+        final_questions.append(q_fixed)
+    return final_questions[:35]
 
 def answer_key(questions, text):
     prompt = f"""
