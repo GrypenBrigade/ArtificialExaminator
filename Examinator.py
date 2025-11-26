@@ -28,7 +28,7 @@ def load_embedder():
 embed = load_embedder()
 
 st.title("Artificial Examinator")
-st.write("Upload PDFs to create a multiple choice question exam, answer key, and knowledge graph.")
+st.write("Upload PDFs to create a multiple choice question exam and answer key.")
 
 
 def call_genai(model, prompt, temperature=0.7, json_mode=False):
