@@ -1,15 +1,24 @@
 from pypdf import PdfReader
-import streamlit as str
-import networkx as nx
-import requests
-import json
+from google import genai
+from google.genai import types
+from sentence_transformers import SentenceTransformer
+from pyvis.network import Network
+import streamlit as st
 import tempfile
 import os
 import re
-from pyvis.network import Network
+import json
+import faiss
+import numpy
 
-OLLURL = "http://localhost:11434/api/generate"
-MODEL = "phi3"
+try:
+    from SECRETS import API
+    api_key = API
+except ImportError:
+    api_key = ""
+
+MODEL = "gemini-2.5-flash"
+
 VERBOTEN = {
     r"\b[A-Z][a-z]+ University\b",
     r"\b[A-Z][a-z]+ College\b",
@@ -17,224 +26,316 @@ VERBOTEN = {
     r"\bProperty of [A-Za-z]+\b"
 }
 
-str.title("Artificial Examinator")
-str.write("Upload PDFs to create a 35-question exam and answer sheet.")
+if api_key:
+    CLIENT = genai.Client(api_key=api_key)
+else:
+    st.warning("API Key missing.")
+    CLIENT = None
 
-def query(prompt):
-    response = requests.post(
-        OLLURL,
-        json={"model": MODEL, "prompt": prompt, "stream": False}
-    )
-    return response.json()["response"]
+@st.cache_resource
+def load_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+embed = load_embedder()
+
+st.title("Artificial Examinator")
+st.write("Upload PDFs to create a multiple choice question exam, answer key, and knowledge graph.")
+
+
+def call_genai(model, prompt, temperature=0.7, json_mode=False):
+    if not CLIENT:
+        return ""
+    
+    config_args = {
+        "temperature": temperature,
+        "max_output_tokens": 2000,
+        "safety_settings": [
+            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
+            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
+            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
+            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_ONLY_HIGH")
+        ]
+    }
+
+    if json_mode:
+        config_args["response_mime_type"] = "application/json"
+
+    try:
+        response = CLIENT.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(**config_args)
+        )
+        return response.text if response.text else ""
+    except Exception as e:
+        print(f"GenAI Error: {e}")
+        return ""
 
 def extraction(pdf_files):
     text = ""
-
     for uploaded_file in pdf_files:
-        reader = PdfReader(uploaded_file)
-
-        for page in reader.pages:
-            txt = page.extract_text()
-
-            if txt:
-                lines = txt.split("\n")
-                lines = [l for l in lines if not l.strip().isdigit()]
-                lines = [l for l in lines if len(l.split()) > 3]
-                text += " ".join(lines) + "\n"
-
+        try:
+            reader = PdfReader(uploaded_file)
+            for page in reader.pages:
+                txt = page.extract_text()
+                if txt:
+                    txt = re.sub(r'\s+', ' ', txt).strip()
+                    text += txt + "\n\n"
+        except Exception as e:
+            st.error(f"Failed to read PDF: {e}")
     return text
 
-def clean_question(text):
-    cleaned = text.replace("\\", " ")
-    for term in VERBOTEN:
-        safe = re.escape(term)
-        cleaned = re.sub(safe, " ", cleaned)
-    return cleaned.strip()
+def embed_text(text, chunk_size=30):
+    if not text.strip():
+        return [], None, None
+    
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    
+    for word in words:
+        current_chunk.append(word)
+        if len(current_chunk) >= chunk_size * 10: 
+            chunks.append(" ".join(current_chunk))
+            current_chunk = []
+    
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
 
-def valid_question(question):
-    if not re.match(r"^\d+\.\s+", question):
-        return False
-    if len(question.split()) < 4:
-        return False
-    if re.search(r"\bAnswer:|\bAns\b|\bCorrect\b", question, re.IGNORECASE):
-        return False
-    if re.search(r"\[\d+\]|\(p\.\d+\)", question):
-        return False
-    if question.endswith(":"):
-        return False
-    return True
+    if not chunks:
+        return [], None, None
 
-def extract_questions(raw):
-    questions = re.split(r'\n\d+\.\s', "\n" + raw)
-    questions = [q.strip() for q in questions if q.strip()]
-    questions = [f"{i+1}. {q}" for i, q in enumerate(questions)]
-    return questions
+    embeddings = embed.encode(chunks, convert_to_numpy=True)
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+    return chunks, embeddings, index
 
-def knowledge_graph(text):
-    graph_prompt = f"""
-Extract key concepts and relationships from the following text.
-Return JSON ONLY in this format:
+def retrieve_chunks(query_text, chunks, index, top_k=3):
+    if not index or not chunks:
+        return ""
+    query_vec = embed.encode([query_text], convert_to_numpy=True)
+    distances, idxs = index.search(query_vec, min(top_k, len(chunks)))
+    valid_idxs = [i for i in idxs[0] if 0 <= i < len(chunks)]
+    return " ".join([chunks[i] for i in valid_idxs])
 
-{{
-    "nodes": ["A", "B"],
-    "edges": [["A", "B"], ["B", "C"]]
-}}
 
-Text:
-{text}
-"""
-    response = query(graph_prompt)
+# def knowledge_graph(text):
+#     if not chunks:
+#         st.error("No text chunks available.")
+#         return {"nodes": [], "edges": []}
 
-    try:
-        return json.loads(response)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", response, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except:
-                return {"nodes": [], "edges": []}
-        return {"nodes": [], "edges": []}
 
-def display_kg(kg):
-    graph = Network(notebook=False, height="650px", width="100%", directed=True)
-    graph.barnes_hut()
+#     num_to_process = 5
+#     step = max(1, len(chunks) // num_to_process)
+#     selected_indices = range(0, len(chunks), step)[:num_to_process]
+    
+#     selected_text = ""
+#     for i in selected_indices:
+#         selected_text += f"--- Section {i+1} ---\n{chunks[i]}\n\n"
 
-    for n in kg["nodes"]:
-        graph.add_node(n, label=n)
+ 
+#     prompt = f"""
+#     Analyze the following text sections from a study handout.
+#     Identify key concepts (Nodes) and their relationships (Edges).
+    
+#     RULES:
+#     1. Output strictly valid JSON.
+#     2. Merge concepts that are similar (e.g., "Tank" and "Tanks" -> "Tank").
+#     3. Format: {{ "nodes": ["A", "B"], "edges": [["A", "B"], ["B", "C"]] }}
+    
+#     Text Sections:
+#     {selected_text}
+#     """
+    
+    
+#     raw_response = call_genai(MODEL, prompt, temperature=0.1, json_mode=True)
 
-    for s, t in kg["edges"]:
-        graph.add_edge(s, t)
+   
+#     try:
+        
+#         cleaned = raw_response.replace("```json", "").replace("```", "").strip()
+        
+        
+#         start = cleaned.find("{")
+#         end = cleaned.rfind("}") + 1
+#         if start != -1 and end != 0:
+#             cleaned = cleaned[start:end]
 
-    temp = tempfile.gettempdir()
-    path = os.path.join(temp, "knowledge_graph.html")
-    graph.save_graph(path)
+#         data = json.loads(cleaned)
+        
+#         if "nodes" not in data: data["nodes"] = []
+#         if "edges" not in data: data["edges"] = []
+        
+#         return data
 
-    str.subheader("Knowledge Graph")
-    str.components.v1.html(open(path, "r").read(), height=650)
+#     except json.JSONDecodeError:
+#         st.warning("Graph generation failed to parse JSON. Retrying with a simplified prompt...")
+#         return {"nodes": [], "edges": []}
 
-def question_batch(prompt, expected=5, max_retries=3):
-    for attempt in range(max_retries):
-        response = query(prompt)
-        raw = extract_questions(response)
-        cleaned = [clean_question(q) for q in raw]
-        valid = [q for q in cleaned if valid_question(q)]
-        if len(valid) >= expected:
-            return valid[:expected]
-    needed = expected - len(valid)
-    valid += [f"{len(valid)+i+1}. [FAILED TO GENERATE QUESTION]" for i in range(needed)]
-    return valid
+# def display_kg(kg):
+#     if not kg or not kg.get("nodes") or len(kg["nodes"]) == 0:
+#         st.warning("No relationships found to graph. (Graph data is empty)")
+#         return
 
-def question_generator(text, size=5, batch=7):
-    questions = []
-    for batch_num in range(1, batch + 1):
-        prompt = f"""
-You are generating batch {batch_num} of {batch}.
-Generate EXACTLY {size} multiple-choice questions based on the text below.
 
-CRITICAL RULES — FOLLOW THEM EXACTLY:
+#     net = Network(notebook=False, height="600px", width="100%", directed=True, 
+#                   bgcolor="#222222", font_color="white")
+    
+#     for n in kg["nodes"]:
+#         net.add_node(n, label=n, color="#4a90e2", title=n)
+    
+#     for edge in kg["edges"]:
+#         if len(edge) >= 2:
+#             source, target = edge[0], edge[1]
+#             if source in kg["nodes"] and target in kg["nodes"]:
+#                 net.add_edge(source, target)
 
-1. You MUST output all {size} questions in full.
-   - Do NOT skip any.
-   - Do NOT summarize.
-   - Do NOT write things like:
-     • "This pattern continues..."
-     • "And so on..."
-     • "Repeat the same for the rest."
-   If you skip or summarize even once, the output is invalid.
+#     net.force_atlas2based()
 
-2. DO NOT copy sentences from the text.
-   - Paraphrase everything.
-   - Reformulate concepts in your own words.
+#     temp_dir = tempfile.gettempdir()
+#     path = os.path.join(temp_dir, "knowledge_graph.html")
+    
+#     try:
+#         net.save_graph(path)
+#         with open(path, 'r', encoding='utf-8') as f:
+#             html = f.read()
+#         st.subheader("Knowledge Graph")
+#         st.components.v1.html(html, height=620)
+#     except Exception as e:
+#         st.error(f"Error displaying graph: {e}")
 
-3. REMOVE ANY personal names, institution names, school names,
-   company names, or specific locations found in the text.
+def question_batch(prompt, chunks, index):
+    context = retrieve_chunks(prompt, chunks, index, top_k=3)
+    if not context and chunks:
+        context = chunks[0] 
 
-4. Each question MUST have:
-   - A clear question
-   - Four answer choices (A–D)
-   - EXACTLY one correct answer
-   - A difficulty label (Easy, Medium, or Hard)
+    full_prompt = f"""
+    Generate 5 multiple-choice questions based on the text below.
+    Format exactly like this:
+    
+    1. Question?
+    A) Option
+    B) Option
+    C) Option
+    D) Option
+    Answer: B (However, hide this in the final output. A seperate function will extract it.)
+    
 
-5. Use this output format EXACTLY:
+    Critical Rules:
+    - Do not reference sample problems provided in the context.
+    - Do not say "Based on the text" or similar phrases.
+    - Ensure questions are clear and unambiguous.
+    - Avoid using any proper nouns or identifiable information.
 
-1. Question text?
-   A. Option
-   B. Option
-   C. Option
-   D. Option
-Correct: B
-Difficulty: Medium
+    Text: {context}
+    """
+    return call_genai(MODEL, full_prompt, temperature=0.5)
 
-2. Question text?
-   A. Option
-   B. Option
-   C. Option
-   D. Option
-Correct: A
-Difficulty: Easy
+def question_generator(text, chunks, index, ui_placeholder, progress_bar):
+    all_questions = []
+    total_needed = 35
+    questions_per_batch = 5
+    batches_needed = (total_needed // questions_per_batch) + 1
 
-(continue this exact pattern until question {size})
+    for i in range(batches_needed):
 
-TEXT FOR QUESTION GENERATION:
-{text}
-"""
-        batch_questions = question_batch(prompt, expected=size)
-        questions.extend(batch_questions)
+        progress_bar.progress((i) / batches_needed)
+        
+        start_idx = i * 400 
+        if start_idx >= len(text): start_idx = 0 
+        query_snippet = text[start_idx : start_idx+400]
+        
 
-    # Renumber to 1-35
+        raw_response = question_batch(query_snippet, chunks, index)
+        
+        if not raw_response: continue
+
+
+        split_qs = re.split(r'\n\d+[\.)]', "\n" + raw_response)
+        new_qs_found = 0
+        
+        for q in split_qs:
+            q = q.strip()
+            if "?" in q and ("Answer:" in q or "Correct:" in q):
+                all_questions.append(q)
+                new_qs_found += 1
+        
+        preview_text = ""
+        for idx, q in enumerate(all_questions, 1):
+             preview_text += f"{idx}. {q}\n\n"
+             
+        ui_placeholder.text_area(
+            f"Generating... ({len(all_questions)} questions found so far)", 
+            preview_text, 
+            height=400
+        )
+        
+        if len(all_questions) >= total_needed:
+            break
+
+    progress_bar.progress(1.0)
+
     final_questions = []
-    for i, q in enumerate(questions, start=1):
-        q_fixed = re.sub(r"^\d+\.", f"{i}.", q)
-        final_questions.append(q_fixed)
-    return final_questions[:35]
+    for i, q in enumerate(all_questions[:total_needed], 1):
+        q = q.replace("Answer:", "Correct:")
+        final_questions.append(f"{i}. {q}")
 
-def answer_key(questions, text):
+    return final_questions
+
+def answer_key(questions):
+    q_text = "\n".join(questions)
     prompt = f"""
-Provide ONLY the answer key in this format:
+    Extract ONLY the answer key from these questions.
+    Format:
+    1. A
+    2. C
+    ...
+    
+    Questions:
+    {q_text}
+    """
+    return call_genai(MODEL, prompt, temperature=0.1)
 
-1. A
-2. C
-3. D
-...
 
-Questions:
-{questions}
 
-Reference text:
-{text}
-"""
-    return query(prompt)
-
-uploaded_files = str.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files:
-    with str.spinner("Extracting text from PDFs..."):
+    with st.spinner("Extracting text..."):
         full_text = extraction(uploaded_files)
 
-    str.success("PDFs loaded successfully!")
+    st.success(f"PDFs loaded ({len(full_text)} chars).")
+    chunks, embeddings, index = embed_text(full_text)
 
-    if str.button("Generate 35 Questions"):
-        with str.spinner("Generating questions..."):
-            questions = question_generator(full_text)
 
-        str.subheader("35 Questions")
-        str.text_area("Questions", questions, height=600)
+    if st.button("Generate Questions"):
+        if len(full_text) < 50:
+            st.error("Text extraction failed (text too short).")
+        else:
+            with st.spinner("Generating questions..."):
+                prog_bar = st.progress(0)
+                live_preview = st.empty()
+                questions = question_generator(full_text, chunks, index, total_needed=35)
 
-        str.session_state["questions"] = questions
-        str.session_state["text"] = full_text
+            if questions:
+                st.session_state["questions"] = questions
+                st.session_state["text"] = full_text
+                st.session_state["chunks"] = chunks # Save chunks for graph
+                # Clear the preview container so we can show the final result cleanly
+                live_preview.empty() 
+                prog_bar.empty()
+            else:
+                st.error("No questions generated.")
 
-    if "questions" in str.session_state:
+    if "questions" in st.session_state:
+        st.subheader("Exam Paper")
+        st.text_area("Questions", "\n\n".join(st.session_state["questions"]), height=500)
 
-        if str.button("Generate Answer Key"):
-            with str.spinner("Generating answer key..."):
-                key = answer_key(str.session_state["questions"], str.session_state["text"])
 
-            str.subheader("Answer Key")
-            str.text_area("Answer Key", key, height=400)
+        if st.button("Generate Answer Key"):
+            with st.spinner("Extracting key..."):
+                key = answer_key(st.session_state["questions"])
+            st.subheader("Answer Key")
+            st.text_area("Key", key, height=400)
 
-        if str.button("Generate Knowledge Graph"):
-            with str.spinner("Generating knowledge graph..."):
-                kg = knowledge_graph(str.session_state["text"])
-
-            display_kg(kg)
