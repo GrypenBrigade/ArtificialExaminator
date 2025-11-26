@@ -1,5 +1,5 @@
 # Artificial Examinator
-## An AI exam generator with Knowledge Graph
+## An AI exam generator Streamlit app
 
 Import lesson handout PDFs to generate a multiple choice question exam paper.
 
