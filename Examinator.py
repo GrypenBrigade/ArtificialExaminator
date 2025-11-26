@@ -120,7 +120,7 @@ def question_batch(prompt, chunks, index):
     B) Option
     C) Option
     D) Option
-    Answer: B (However, hide this in the final output. A seperate function will extract it.)
+    Answer: A
     
 
     Critical Rules:
@@ -128,6 +128,7 @@ def question_batch(prompt, chunks, index):
     - Do not say "Based on the text" or similar phrases.
     - Ensure questions are clear and unambiguous.
     - Avoid using any proper nouns or identifiable information.
+    - Vary the difficulty of questions (easy, medium, hard).
 
     Text: {context}
     """
