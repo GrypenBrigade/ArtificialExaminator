@@ -3,8 +3,8 @@
 
 Import lesson handout PDFs to generate a multiple choice question exam paper.
 
-Model used: gemini-2.5-flash
-Embedder model used: all-MiniLM-L6-v2
+<p>Model used: gemini-2.5-flash<br>
+Embedder model used: all-MiniLM-L6-v2</p>
 
 ## How to use:
 1. Install the necessary python packages with this command: `pip install streamlit pypdf google google.genai sentence-transformers faiss-cpu`
